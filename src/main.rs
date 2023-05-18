@@ -15,9 +15,10 @@ use winapi::um::errhandlingapi::GetLastError;
 use winapi::um::handleapi::{INVALID_HANDLE_VALUE, CloseHandle};
 use winapi::um::memoryapi::{VirtualFree, CreateFileMappingW, UnmapViewOfFileEx};
 use winapi::um::sysinfoapi::{SYSTEM_INFO, GetSystemInfo};
-use winapi::um::winnt::{MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, MEM_PHYSICAL, HANDLE, PVOID};
+use winapi::um::winnt::{MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, MEM_PHYSICAL, HANDLE, PVOID, MEM_COMMIT, PAGE_READWRITE};
 
 use core::alloc::Layout;
+use core::mem::size_of;
 use core::ops::Deref;
 use core::ptr::{NonNull, null_mut};
 
@@ -25,8 +26,10 @@ use core::ptr::{NonNull, null_mut};
 
 fn main() {
     let size = 1 << 40; // 1 TiB
-    let demo = SparseBox::<u8>::new_zeroed_slice(size);
-    assert_eq!(0u8, demo[size/2]);
+    let mut demo = SparseBox::<u8>::new_zeroed_slice(size);
+    demo.copy_from_slice_at(size/2-10, &[1u8; 21][..]);
+    assert_eq!(0u8, demo[size/3]);
+    assert_eq!(1u8, demo[size/2]);
 }
 
 
@@ -44,11 +47,11 @@ impl<T: ?Sized> Drop for SparseBox<T> {
             let chunk_base = unsafe { self.data.as_ptr().cast::<u8>().add(offset).cast() };
 
             let success = unsafe { UnmapViewOfFileEx(chunk_base, 0) };
-            assert!(success != 0, "UnmapViewOfFileEx({chunk_base:?}, 0) failed with GetLastError() == {}", get_last_error());
-
-            // XXX: while the sample does more-or-less this without error checking, this fails... and didn't we already free memory?
-            //let success = unsafe { VirtualFree(chunk_base, 0, MEM_RELEASE) };
-            //assert!(success != 0, "VirtualFree({chunk_base:?}, 0, MEM_RELEASE) failed with GetLastError() == {}", get_last_error());
+            if success == 0 {
+                // If UnmapViewOfFileEx failed, assume we replaced that chunk's file view with unique committed memory
+                let success = unsafe { VirtualFree(chunk_base, 0, MEM_RELEASE) };
+                assert!(success != 0, "VirtualFree({chunk_base:?}, 0, MEM_RELEASE) failed with GetLastError() == {}", get_last_error());
+            }
         }
 
         // zeroed_chunk will drop to CloseHandle(zeroed_chunk.0)
@@ -61,7 +64,8 @@ impl<T> SparseBox<T> {
     pub fn try_new_zeroed_slice(len: usize) -> Result<SparseBox<[T]>, SparseBoxError> where T : Zeroable {
         let layout = Layout::array::<T>(len)?;
         //let chunk_size_32 = get_system_info().dwPageSize; // 4 KiB at a time is way too slow
-        let chunk_size_32 = 1 << 30; // 1 GiB
+        let chunk_size_32 : u32 = 1 << 30; // 1 GiB
+        assert!(chunk_size_32.is_power_of_two());
         let chunk_size : usize = chunk_size_32.try_into().map_err(|_| SparseBoxError(()))?; // lol 16 bit windows go brrr
         let total_size = (layout.size().saturating_sub(1)/chunk_size+1)*chunk_size; // round up to multiple of chunk_size
 
@@ -92,6 +96,31 @@ impl<T> SparseBox<T> {
         let data = unsafe { NonNull::new_unchecked(core::ptr::slice_from_raw_parts_mut(data.as_ptr().cast(), len)) };
 
         Ok(SparseBox { data, chunk_size, total_size, zeroed_chunk })
+    }
+}
+
+impl<T> SparseBox<[T]> {
+    pub fn copy_from_slice_at(&mut self, start: usize, src: &[T]) where T : Copy {
+        assert!(start < self.len());
+        let end = start.checked_add(src.len()).expect("unable to write full range: usize::MAX overflows");
+        assert!(end <= self.len());
+
+        let chunk_size  = self.chunk_size;
+        let chunk_mask  = chunk_size - 1;
+        let byte_start  = (start * size_of::<T>()) & !chunk_mask;
+        let byte_end    = (end * size_of::<T>()).saturating_add(chunk_mask) & !chunk_mask;
+        for offset in (byte_start .. byte_end).step_by(chunk_size) {
+            let chunk_base = unsafe { self.data.as_ptr().cast::<u8>().add(offset).cast() };
+
+            let success = unsafe { UnmapViewOfFileEx(chunk_base, MEM_PRESERVE_PLACEHOLDER) };
+            if success == 0 { continue } // XXX: assume we already committed that page
+
+            let _commit = unsafe { VirtualAlloc2(null_mut(), chunk_base, chunk_size, MEM_COMMIT | MEM_RESERVE | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, null_mut(), 0) };
+            assert!(!_commit.is_null(), "VirtualAlloc2(nullptr, {chunk_base:?}, {chunk_size}, MEM_COMMIT | MEM_RESERVE | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) failed with GetLastError() == {err}", err=get_last_error());
+        }
+
+        let data = unsafe { self.data.as_mut() };
+        data[start .. end].copy_from_slice(src);
     }
 }
 
