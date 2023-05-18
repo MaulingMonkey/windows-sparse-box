@@ -19,7 +19,7 @@ use winapi::um::winnt::{MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, 
 
 use core::alloc::Layout;
 use core::mem::size_of;
-use core::ops::Deref;
+use core::ops::{Deref, RangeBounds};
 use core::ptr::{NonNull, null_mut};
 
 
@@ -31,6 +31,7 @@ fn main() {
     demo.copy_from_slice_at(size/2-10, &[1u8; 21][..]);
     assert_eq!(0u8, demo[size/3]);
     assert_eq!(1u8, demo[size/2]);
+    std::dbg!(demo.get_mut(size/2-20 ..= size/2+20));
 }
 
 
@@ -101,10 +102,19 @@ impl<T> SparseBox<T> {
 }
 
 impl<T> SparseBox<[T]> {
-    pub fn copy_from_slice_at(&mut self, start: usize, src: &[T]) where T : Copy {
-        assert!(start < self.len());
-        let end = start.checked_add(src.len()).expect("unable to write full range: usize::MAX overflows");
-        assert!(end <= self.len());
+    pub fn get_mut(&mut self, range: impl RangeBounds<usize>) -> Option<&mut [T]> {
+        let len = self.len();
+        let start = match range.start_bound() {
+            core::ops::Bound::Unbounded     => 0,
+            core::ops::Bound::Included(i)   => *i,
+            core::ops::Bound::Excluded(i)   => i.checked_add(1)?,
+        };
+        let end = match range.end_bound() {
+            core::ops::Bound::Unbounded     => len,
+            core::ops::Bound::Included(i)   => i.checked_add(1)?,
+            core::ops::Bound::Excluded(i)   => *i,
+        };
+        if !(start <= end && end <= len) { return None }
 
         let chunk_size  = self.chunk_size;
         let chunk_mask  = chunk_size - 1;
@@ -121,7 +131,12 @@ impl<T> SparseBox<[T]> {
         }
 
         let data = unsafe { self.data.as_mut() };
-        data[start .. end].copy_from_slice(src);
+        data.get_mut(start .. end)
+    }
+
+    pub fn copy_from_slice_at(&mut self, start: usize, src: &[T]) where T : Copy {
+        let end = start.checked_add(src.len()).expect("unable to write range: out of bounds");
+        self.get_mut(start .. end).expect("unable to write range: out of bounds").copy_from_slice(src);
     }
 }
 
