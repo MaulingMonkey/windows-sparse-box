@@ -27,6 +27,7 @@ use core::ptr::{NonNull, null_mut};
 fn main() {
     let size = 1 << 40; // 1 TiB
     let mut demo = SparseBox::<u8>::new_zeroed_slice(size);
+    demo.copy_from_slice_at(size/2-10, &[2u8; 21][..]);
     demo.copy_from_slice_at(size/2-10, &[1u8; 21][..]);
     assert_eq!(0u8, demo[size/3]);
     assert_eq!(1u8, demo[size/2]);
